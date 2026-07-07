@@ -1,0 +1,59 @@
+name: Supabase Keep Alive (Multi-Project)
+
+# ---------------------------------------------------------------------
+# 여러 Supabase 프로젝트를 하나의 워크플로로 keep-alive
+# 프로젝트 목록은 SUPABASE_PROJECTS 시크릿(JSON 배열)에 저장
+# 추가/삭제 시 이 파일은 수정 불필요 — 시크릿만 편집하면 됨
+# ---------------------------------------------------------------------
+on:
+  schedule:
+    - cron: "0 6 * * 1,4"   # 매주 월·목 06:00 UTC (한국시간 15:00)
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping all Supabase projects
+        env:
+          # 형식 예시(줄바꿈 없이 한 줄로 저장해도 됨):
+          # [
+          #   {"name":"solar-agri","url":"https://aaa.supabase.co","key":"service_role_key_1"},
+          #   {"name":"dream-bridge","url":"https://bbb.supabase.co","key":"service_role_key_2"}
+          # ]
+          SUPABASE_PROJECTS: ${{ secrets.SUPABASE_PROJECTS }}
+        run: |
+          set -euo pipefail
+
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          FAILED=0
+          COUNT=$(echo "${SUPABASE_PROJECTS}" | jq 'length')
+          echo "Pinging ${COUNT} project(s) at ${NOW}"
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME=$(echo "${SUPABASE_PROJECTS}" | jq -r ".[$i].name")
+            URL=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].url")
+            KEY=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].key")
+
+            HTTP_CODE=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
+              -X PATCH "${URL}/rest/v1/keep_alive?id=eq.1" \
+              -H "apikey: ${KEY}" \
+              -H "Authorization: Bearer ${KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=minimal" \
+              -d "{\"last_ping\": \"${NOW}\"}")
+
+            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+              echo "  [OK]   ${NAME} (HTTP ${HTTP_CODE})"
+            else
+              echo "::error::[FAIL] ${NAME} (HTTP ${HTTP_CODE}) $(cat /tmp/resp.txt)"
+              FAILED=1
+            fi
+          done
+
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "::error::One or more keep-alive pings failed"
+            exit 1
+          fi
+
+          echo "All keep-alive pings succeeded"
