@@ -23,37 +23,103 @@ jobs:
           # ]
           SUPABASE_PROJECTS: ${{ secrets.SUPABASE_PROJECTS }}
         run: |
-          set -euo pipefail
+          set -uo pipefail   # errexit(-e)는 끄고 프로젝트별로 직접 실패 처리(하나 실패해도 나머지 계속 ping)
 
-          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          FAILED=0
-          COUNT=$(echo "${SUPABASE_PROJECTS}" | jq 'length')
-          echo "Pinging ${COUNT} project(s) at ${NOW}"
-
-          for i in $(seq 0 $((COUNT - 1))); do
-            NAME=$(echo "${SUPABASE_PROJECTS}" | jq -r ".[$i].name")
-            URL=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].url")
-            KEY=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].key")
-
-            HTTP_CODE=$(curl -s -o /tmp/resp.txt -w "%{http_code}" \
-              -X PATCH "${URL}/rest/v1/keep_alive?id=eq.1" \
-              -H "apikey: ${KEY}" \
-              -H "Authorization: Bearer ${KEY}" \
-              -H "Content-Type: application/json" \
-              -H "Prefer: return=minimal" \
-              -d "{\"last_ping\": \"${NOW}\"}")
-
-            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
-              echo "  [OK]   ${NAME} (HTTP ${HTTP_CODE})"
-            else
-              echo "::error::[FAIL] ${NAME} (HTTP ${HTTP_CODE}) $(cat /tmp/resp.txt)"
-              FAILED=1
-            fi
-          done
-
-          if [ "${FAILED}" -ne 0 ]; then
-            echo "::error::One or more keep-alive pings failed"
+          # --- 시크릿 유효성 먼저 검증 ---
+          if [ -z "${SUPABASE_PROJECTS:-}" ]; then
+            echo "::error::SUPABASE_PROJECTS 시크릿이 비어있거나 설정되지 않았습니다."
+            exit 1
+          fi
+          if ! echo "${SUPABASE_PROJECTS}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "::error::SUPABASE_PROJECTS 가 JSON 배열이 아닙니다. 형식을 확인하세요."
             exit 1
           fi
 
-          echo "All keep-alive pings succeeded"
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          COUNT=$(echo "${SUPABASE_PROJECTS}" | jq 'length')
+          OK=0
+          FAILED=0
+          SUMMARY=""   # Step Summary 표 누적
+
+          echo "===================================================="
+          echo " Supabase Keep-Alive  |  ${NOW}  |  ${COUNT} project(s)"
+          echo "===================================================="
+
+          for i in $(seq 0 $((COUNT - 1))); do
+            NAME=$(echo "${SUPABASE_PROJECTS}" | jq -r ".[$i].name // \"(no-name-#$i)\"")
+            URL=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].url  // empty")
+            KEY=$(echo "${SUPABASE_PROJECTS}"  | jq -r ".[$i].key  // empty")
+
+            echo "::group::${NAME}"
+
+            # url/key 누락 사전 차단 (설정 실수 즉시 진단)
+            if [ -z "${URL}" ] || [ -z "${KEY}" ]; then
+              REASON="설정오류: url 또는 key 누락"
+              echo "  [FAIL] ${NAME} -> ${REASON}"
+              echo "::error::[${NAME}] ${REASON}"
+              SUMMARY="${SUMMARY}| ${NAME} | ❌ | - | - | ${REASON} |"$'\n'
+              FAILED=$((FAILED + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            # upsert(POST + merge-duplicates): id=1 행이 없으면 생성, 있으면 갱신.
+            # return=representation 으로 실제 써진 행을 돌려받아 no-op(0건)까지 검증.
+            HTTP_CODE=$(curl -s -m 20 -o /tmp/resp.txt -w "%{http_code}" \
+              -X POST "${URL}/rest/v1/keep_alive" \
+              -H "apikey: ${KEY}" \
+              -H "Authorization: Bearer ${KEY}" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: resolution=merge-duplicates,return=representation" \
+              -d "{\"id\": 1, \"last_ping\": \"${NOW}\"}")
+            HTTP_CODE=${HTTP_CODE:-000}   # curl 자체 실행 실패(바이너리 부재 등) 대비 기본값
+
+            # 응답이 JSON 배열일 때만 행 수/last_ping 추출 (에러 응답 오판 방지)
+            ROWS=$(jq 'if type == "array" then length else 0 end' /tmp/resp.txt 2>/dev/null || echo 0)
+            WROTE=$(jq -r 'if type == "array" and length > 0 then .[0].last_ping else "n/a" end' /tmp/resp.txt 2>/dev/null || echo "n/a")
+            BODY=$(head -c 300 /tmp/resp.txt 2>/dev/null | tr '\n' ' ')
+
+            if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ] && [ "${ROWS}" -ge 1 ]; then
+              echo "  [OK]   ${NAME}  HTTP ${HTTP_CODE}  rows=${ROWS}  last_ping=${WROTE}"
+              SUMMARY="${SUMMARY}| ${NAME} | ✅ | ${HTTP_CODE} | ${ROWS} | last_ping=${WROTE} |"$'\n'
+              OK=$((OK + 1))
+            else
+              # 실패 원인 분류 (정확한 진단)
+              case "${HTTP_CODE}" in
+                000)         REASON="네트워크/DNS 실패 또는 타임아웃 (url 확인)";;
+                401|403)     REASON="인증 실패 (service_role key 만료/오류)";;
+                404)         REASON="404: keep_alive 테이블 없음 또는 url 오류";;
+                2*|3*)       REASON="성공응답이나 write 0건 (id=1 upsert 실패 — PK/unique 확인)";;
+                *)           REASON="HTTP ${HTTP_CODE} 오류";;
+              esac
+              echo "  [FAIL] ${NAME}  HTTP ${HTTP_CODE}  rows=${ROWS}  -> ${REASON}"
+              echo "         resp: ${BODY}"
+              echo "::error::[${NAME}] ${REASON} (HTTP ${HTTP_CODE}) ${BODY}"
+              SUMMARY="${SUMMARY}| ${NAME} | ❌ | ${HTTP_CODE} | ${ROWS} | ${REASON} |"$'\n'
+              FAILED=$((FAILED + 1))
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "===================================================="
+          echo " 결과: OK ${OK} / FAIL ${FAILED} / 총 ${COUNT}"
+          echo "===================================================="
+
+          # ---- Actions 실행 요약 화면(Step Summary)에 표로 출력 ----
+          {
+            echo "### Supabase Keep-Alive 결과"
+            echo ""
+            echo "- 시각(UTC): \`${NOW}\`"
+            echo "- 성공 **${OK}** / 실패 **${FAILED}** / 총 **${COUNT}**"
+            echo ""
+            echo "| 프로젝트 | 상태 | HTTP | rows | 비고 |"
+            echo "|---|:---:|:---:|:---:|---|"
+            printf "%s" "${SUMMARY}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "::error::${FAILED}개 프로젝트의 keep-alive ping 실패 — 위 로그/요약 참고"
+            exit 1
+          fi
+
+          echo "모든 keep-alive ping 성공 (${OK}/${COUNT})"
