@@ -17,7 +17,7 @@ jobs:
       contents: write   # heartbeat 파일 커밋/푸시(저장소 활동 갱신)에 필요
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Ping all Supabase projects
         env:
