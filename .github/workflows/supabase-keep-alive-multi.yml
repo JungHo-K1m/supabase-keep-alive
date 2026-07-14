@@ -13,7 +13,12 @@ on:
 jobs:
   ping:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # heartbeat 파일 커밋/푸시(저장소 활동 갱신)에 필요
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Ping all Supabase projects
         env:
           # 형식 예시(줄바꿈 없이 한 줄로 저장해도 됨):
@@ -127,3 +132,25 @@ jobs:
           fi
 
           echo "모든 keep-alive ping 성공 (${OK}/${COUNT})"
+
+      # GitHub는 저장소 활동이 60일간 없으면 schedule 트리거를 자동 비활성화한다.
+      # 매 실행마다 heartbeat 파일을 커밋/푸시해 저장소를 항상 활성 상태로 유지.
+      # ping 실패로 앞 스텝이 exit 1 되어도 반드시 실행되도록 if: always().
+      - name: Keep repository active (prevent 60-day auto-disable)
+        if: always()
+        run: |
+          set -euo pipefail
+          STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "last keep-alive run (UTC): ${STAMP}" > keepalive-heartbeat.txt
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add keepalive-heartbeat.txt
+
+          if git diff --cached --quiet; then
+            echo "heartbeat 변경 없음 — 커밋 생략"
+          else
+            git commit -m "chore: keep-alive heartbeat ${STAMP} [skip ci]"
+            git push
+            echo "heartbeat 커밋/푸시 완료 (${STAMP})"
+          fi
