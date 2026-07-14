@@ -23,7 +23,10 @@ jobs:
           # ]
           SUPABASE_PROJECTS: ${{ secrets.SUPABASE_PROJECTS }}
         run: |
-          set -uo pipefail   # errexit(-e)는 끄고 프로젝트별로 직접 실패 처리(하나 실패해도 나머지 계속 ping)
+          # GitHub는 셸을 'bash -e {0}'로 강제 실행하므로 errexit를 명시적으로 끈다.
+          # (안 그러면 한 프로젝트의 curl 실패 시 스크립트 전체가 중단되어 나머지가 ping 안 됨)
+          set +e
+          set -uo pipefail
 
           # --- 시크릿 유효성 먼저 검증 ---
           if [ -z "${SUPABASE_PROJECTS:-}" ]; then
