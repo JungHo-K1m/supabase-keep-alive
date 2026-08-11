@@ -7,7 +7,10 @@ name: Supabase Keep Alive (Multi-Project)
 # ---------------------------------------------------------------------
 on:
   schedule:
-    - cron: "0 6 * * 1,4"   # 매주 월·목 06:00 UTC (한국시간 15:00)
+    # Supabase 무료 플랜 정지 기준은 "하루에 몇 건" 수준의 지속 활동량
+    # (https://supabase.com/docs/guides/platform/free-project-pausing)
+    # 주 2회로는 기준 미달로 정지됨(2026-08 확인) → 매일 2회로 상향
+    - cron: "0 6,18 * * *"   # 매일 06:00, 18:00 UTC (한국시간 15:00, 03:00)
   workflow_dispatch: {}
 
 jobs:
@@ -134,12 +137,24 @@ jobs:
           echo "모든 keep-alive ping 성공 (${OK}/${COUNT})"
 
       # GitHub는 저장소 활동이 60일간 없으면 schedule 트리거를 자동 비활성화한다.
-      # 매 실행마다 heartbeat 파일을 커밋/푸시해 저장소를 항상 활성 상태로 유지.
+      # heartbeat 파일을 주 1회 커밋/푸시해 저장소를 항상 활성 상태로 유지.
       # ping 실패로 앞 스텝이 exit 1 되어도 반드시 실행되도록 if: always().
       - name: Keep repository active (prevent 60-day auto-disable)
         if: always()
         run: |
           set -euo pipefail
+
+          # 매일 2회 실행으로 바뀌면서 매 실행 커밋은 과함 —
+          # 60일 규칙 대비로는 주 1회 커밋이면 충분하므로 7일 미만이면 생략
+          # (shallow clone에서 git log는 부정확하므로 파일 내 타임스탬프로 판단)
+          LAST_STAMP=$(sed 's/^.*: //' keepalive-heartbeat.txt 2>/dev/null || true)
+          LAST_TS=$(date -d "${LAST_STAMP:-1970-01-01T00:00:00Z}" +%s 2>/dev/null || echo 0)
+          AGE=$(( $(date +%s) - LAST_TS ))
+          if [ "${AGE}" -lt 604800 ]; then
+            echo "heartbeat 최근 커밋이 7일 이내(${AGE}s 경과) — 커밋 생략"
+            exit 0
+          fi
+
           STAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "last keep-alive run (UTC): ${STAMP}" > keepalive-heartbeat.txt
 
